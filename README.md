@@ -1,2 +1,2 @@
 # shift_organizer
-an organizer of shifts in shaarey tzedek toranim 
+an organizer of shifts for shaarey tzedek toranim 
