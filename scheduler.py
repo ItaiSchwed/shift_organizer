@@ -138,7 +138,8 @@ def add_prefer_not_work_penalties(model, assignments, prefer_not_working, worker
         penalty_terms.append(penalty_var * penalty_size)
 
 
-def add_prefer_working_penalties(model, assignments, prefer_working, workers, dates, shifts, penalty_terms, penalty_size):
+def add_prefer_working_penalties(model, assignments, prefer_working, workers, dates, shifts, penalty_terms,
+                                 penalty_size):
     """Penalty for not assigning a worker on a preferred working day while assigning on other non-preferred days."""
     for worker in workers:
         # Get the days the worker prefers to work
@@ -333,6 +334,7 @@ def get_schedule(source, dates):
                     if solver.Value(assignments[(worker, date, shift)]):
                         schedule_data[date][workers.index(worker)] = shift
 
+        # Create the DataFrame with the MultiIndex
         df_schedule = pd.DataFrame(schedule_data, index=workers)
 
         metadata = {'dates_off': dates_off,
@@ -340,11 +342,16 @@ def get_schedule(source, dates):
                     'prefer_not_working': prefer_not_working}
 
         scores = {
-            'התאמת תורנות לדרגה': shift_rating_score(df_schedule, worker_ratings, workers, dates, shifts, max_shift_distance),
+            'התאמת תורנות לדרגה': shift_rating_score(df_schedule, worker_ratings, workers, dates, shifts,
+                                                     max_shift_distance),
             'העדפה לא לעבוד': prefer_not_work_score(df_schedule, prefer_not_working, dates_off, workers, dates),
             'העדפה לעבוד': prefer_work_score(df_schedule, prefer_working, dates_off, workers, dates),
             'שוויון בחלוקה': shift_distribution_score(df_schedule, workers, dates, shifts, freedom)
         }
+
+        # Create a list of tuples (worker, rating) for the MultiIndex
+        df_schedule.index = pd.MultiIndex.from_tuples([(worker, worker_ratings[worker]) for worker in workers],
+                                                      names=['שם', 'דרגה'])
 
         statistics = get_statistics(df_schedule, weekday_weights)
 
