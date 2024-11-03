@@ -1,9 +1,6 @@
-from collections import defaultdict
-
 import numpy as np
 import pandas as pd
-from itertools import product, combinations
-from datetime import datetime, timedelta
+from itertools import combinations
 from ortools.sat.python import cp_model
 
 
@@ -35,6 +32,16 @@ def add_days_off_constraints(model, assignments, dates_off, shifts):
         for worker_off_date in worker_dates:
             for shift in shifts:
                 model.Add(assignments[(worker, worker_off_date, shift)] == 0)
+
+
+def add_experts_constraints(model, assignments, experts, dates, shifts, prefer_working):
+    for expert in experts:
+        for shift in shifts:
+            for date in dates:
+                if date in prefer_working.get(expert, []):
+                    model.Add(assignments[(expert, date, shift)] == int(shift == 1))
+                else:
+                    model.Add(assignments[(expert, date, shift)] == 0)
 
 
 def add_balanced_distribution_constraints(model, assignments, workers, dates, shifts, weekday_weights, weighted_freedom,
@@ -70,24 +77,22 @@ def add_one_free_weekend_constraints(model, assignments, workers, dates, shifts)
         model.Add(worker_shifts_count <= 3)
 
 
-def add_worker_skill_constraints(model, assignments, worker_ratings, workers, dates, shifts, max_shift_distance):
+def add_worker_skill_constraints(model, assignments, worker_ratings, non_experts, dates, shifts, max_shift_distance):
     """ 7. Worker skill compatibility (strict constraint)
     - a worker should not do a skill smaller than its skill (4 can do 4-7 etc.)
     - a worker should not do a skill to big than its skill (3 should not do 6 and 7)
     """
-    for worker in workers:
+    for worker in non_experts:
         worker_rating = worker_ratings[worker]
         for date in dates:
             for shift in shifts:
-                if worker_rating > shift:
-                    model.Add(assignments[(worker, date, shift)] == 0)
-                if worker_rating + max_shift_distance < shift:
+                if (worker_rating > shift) or (worker_rating + max_shift_distance < shift):
                     model.Add(assignments[(worker, date, shift)] == 0)
 
 
-def add_shift_rating_penalties(assignments, worker_ratings, workers, dates, shifts, penalty_terms, penalty_size):
+def add_shift_rating_penalties(assignments, worker_ratings, non_experts, dates, shifts, penalty_terms, penalty_size):
     """ 8. Prefer workers to be assigned to shifts matching their rating (soft constraint) """
-    for worker in workers:
+    for worker in non_experts:
         worker_rating = worker_ratings[worker]
         for date in dates:
             for shift in shifts:
@@ -187,10 +192,12 @@ def add_shift_distribution_penalties(model, assignments, workers, dates, shifts,
         penalty_terms.append(penalty_size * overworked_shifts)
 
 
-def shift_rating_score(df, worker_ratings, workers, dates, shifts, max_shift_distance):
+def shift_rating_score(df, worker_ratings, workers, dates, shifts, expert_rating, max_shift_distance):
     penalties = 0
     for worker in workers:
         worker_rating = worker_ratings[worker]
+        if worker_rating == expert_rating:
+            continue
         for date in dates:
             if not np.isnan(df.loc[worker, date]) and worker_rating != df.loc[worker, date]:
                 penalties += abs(worker_rating - df.loc[worker, date])
@@ -220,23 +227,20 @@ def prefer_work_score(df, prefer_working, dates_off, workers, dates):
         worker_dates_off = dates_off.get(worker, [])
         other_dates = list(all_dates - set(worker_prefer_working) - set(worker_dates_off))
         for date in dates:
-            if not np.isnan(df.loc[worker, date]) and date in other_dates and len(worker_prefer_working) != 0:
+            work_on_date = not np.isnan(df.loc[worker, date])
+            date_not_preferable = date in other_dates
+            if work_on_date and date_not_preferable and len(worker_prefer_working) != 0:
                 penalties += 1
                 worker_prefer_working = worker_prefer_working[1:]
     return 1 - (penalties / sum([min(len(worker_prefer_working), (~df.loc[worker, :].isna()).sum())
                                  for worker, worker_prefer_working in prefer_working.items()]))
 
 
-def shift_distribution_score(df, workers, dates, shifts, freedom):
-    avg_shifts_per_worker = np.round(len(dates) * len(shifts) / len(workers))
-    print(avg_shifts_per_worker)
+def shift_distribution_score(df, workers, freedom):
     total_shifts = (~df.isna()).sum(axis=1)
-    print(total_shifts)
-    penalties = (total_shifts - avg_shifts_per_worker).abs().sum()
-    print((total_shifts - avg_shifts_per_worker).abs())
-    print(penalties)
-    print((freedom / 2))
-    print((freedom / 2) * len(workers))
+    avg_shifts_per_worker = total_shifts.mean().round().item()
+    min_gap = total_shifts.sum() % avg_shifts_per_worker
+    penalties = (total_shifts - avg_shifts_per_worker).abs().sum() - min_gap
     return 1 - (penalties / ((freedom / 2) * len(workers)))
 
 
@@ -258,8 +262,11 @@ def get_statistics(df_schedule, weekday_weights):
     return statistics
 
 
-def get_schedule(source, dates):
+def get_schedule(source, dates, max_shift_distance, freedom, weighted_freedom, weekday_weights):
+    expert_rating = 'בכיר'
     workers = source.name.to_list()
+    experts = [row['name'] for index, row in source.iterrows() if row.rating == expert_rating]
+    non_experts = list(set(workers) - set(experts))
 
     # Number of shifts per day
     shifts = range(1, 8)  # Shift numbers will be 1 to 7
@@ -272,6 +279,9 @@ def get_schedule(source, dates):
     prefer_not_working_string = 'מעדיפ/ה שלא'
     prefer_not_working = {source.loc[row, 'name']: source.columns[source.loc[row] == prefer_not_working_string].tolist()
                           for row in source.index}
+    prefer_not_working = {worker: worker_prefer_not_working
+                          for worker, worker_prefer_not_working in prefer_not_working.items() if
+                          worker_prefer_not_working}
 
     prefer_working_string = 'רוצה לעבוד'
     prefer_working = {source.loc[row, 'name']: source.columns[source.loc[row] == prefer_working_string].tolist()
@@ -293,29 +303,25 @@ def get_schedule(source, dates):
     # Penalty terms
     penalty_terms = []
 
-    weekday_weights = {6: 1, 0: 1, 1: 1, 2: 1, 3: 2, 4: 3, 5: 3}
-    max_shift_distance = 2
-    weighted_freedom = 3
-    freedom = 2
-
     # Add constraints
     add_shift_assignment_constraints(model, assignments, workers, dates, shifts)
     add_worker_daily_shift_constraints(model, assignments, workers, dates, shifts)
-    add_no_consecutive_workdays_constraints(model, assignments, workers, dates, shifts)
+    add_no_consecutive_workdays_constraints(model, assignments, non_experts, dates, shifts)
 
-    add_one_free_weekend_constraints(model, assignments, workers, dates, shifts)
-    add_balanced_distribution_constraints(model, assignments, workers, dates, shifts, weekday_weights,
-                                          weighted_freedom, freedom)
+    add_one_free_weekend_constraints(model, assignments, non_experts, dates, shifts)
+    add_balanced_distribution_constraints(model, assignments, non_experts, dates, shifts,
+                                          weekday_weights, weighted_freedom, freedom)
 
     add_days_off_constraints(model, assignments, dates_off, shifts)
-    add_worker_skill_constraints(model, assignments, worker_ratings, workers, dates, shifts, max_shift_distance)
+    add_experts_constraints(model, assignments, experts, dates, shifts, prefer_working)
+    add_worker_skill_constraints(model, assignments, worker_ratings, non_experts, dates, shifts, max_shift_distance)
 
     # Add penalties
-    add_shift_rating_penalties(assignments, worker_ratings, workers, dates, shifts, penalty_terms, 4)
-    add_prefer_not_work_penalties(model, assignments, prefer_not_working, workers, dates, dates_off, shifts,
-                                  penalty_terms, 1)
-    add_prefer_working_penalties(model, assignments, prefer_working, workers, dates, shifts, penalty_terms, 1)
-    add_shift_distribution_penalties(model, assignments, workers, dates, shifts, penalty_terms, 10)
+    add_shift_rating_penalties(assignments, worker_ratings, non_experts, dates, shifts, penalty_terms, 4)
+    add_prefer_not_work_penalties(model, assignments, prefer_not_working, non_experts,
+                                  dates, dates_off, shifts, penalty_terms, 1)
+    add_prefer_working_penalties(model, assignments, prefer_working, non_experts, dates, shifts, penalty_terms, 1)
+    add_shift_distribution_penalties(model, assignments, non_experts, dates, shifts, penalty_terms, 10)
 
     # Objective: Minimize the sum of all penalty terms
     model.Minimize(sum(penalty_terms))
@@ -341,17 +347,26 @@ def get_schedule(source, dates):
                     'prefer_working': prefer_working,
                     'prefer_not_working': prefer_not_working}
 
+        non_experts_prefer_working = {worker: worker_prefer_working for worker, worker_prefer_working
+                                      in prefer_working.items() if worker in non_experts}
+
         scores = {
-            'התאמת תורנות לדרגה': shift_rating_score(df_schedule, worker_ratings, workers, dates, shifts,
-                                                     max_shift_distance),
-            'העדפה לא לעבוד': prefer_not_work_score(df_schedule, prefer_not_working, dates_off, workers, dates),
-            'העדפה לעבוד': prefer_work_score(df_schedule, prefer_working, dates_off, workers, dates),
-            'שוויון בחלוקה': shift_distribution_score(df_schedule, workers, dates, shifts, freedom)
+            'התאמת תורנות לדרגה': shift_rating_score(df_schedule.loc[non_experts], worker_ratings, non_experts,
+                                                     dates, shifts, expert_rating, max_shift_distance),
+            'העדפה לא לעבוד': prefer_not_work_score(df_schedule.loc[non_experts], prefer_not_working,
+                                                    dates_off, non_experts, dates),
+            'העדפה לעבוד': prefer_work_score(df_schedule.loc[non_experts], non_experts_prefer_working,
+                                             dates_off, non_experts, dates),
+            'שוויון בחלוקה': shift_distribution_score(df_schedule.loc[non_experts], non_experts, freedom)
         }
 
         # Create a list of tuples (worker, rating) for the MultiIndex
         df_schedule.index = pd.MultiIndex.from_tuples([(worker, worker_ratings[worker]) for worker in workers],
                                                       names=['שם', 'דרגה'])
+
+        name_index = df_schedule.index.levels[0].astype(str)
+        rating_index = df_schedule.index.levels[1].astype(str)
+        df_schedule.index = df_schedule.index.set_levels([name_index, rating_index])
 
         statistics = get_statistics(df_schedule, weekday_weights)
 
@@ -359,7 +374,3 @@ def get_schedule(source, dates):
     else:
         print("No solution found.")
         return None, None, None, None
-
-
-if __name__ == '__main__':
-    get_schedule(source)
